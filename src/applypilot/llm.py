@@ -64,7 +64,26 @@ def _detect_provider() -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 _MAX_RETRIES = 5
-_TIMEOUT = 120  # seconds
+_TIMEOUT = 120  # seconds — hosted APIs
+
+# Local models are an order of magnitude slower per token, and a reasoning model
+# emitting ~1700 tokens on consumer hardware routinely exceeds 120s. A timeout
+# here is not a transient fault the way it is against a hosted API — the model is
+# simply still working — so give local endpoints a much longer leash.
+_LOCAL_TIMEOUT = 900  # seconds
+
+
+def _resolve_timeout(base_url: str) -> float:
+    """Pick a request timeout: LLM_TIMEOUT override, else local vs hosted default."""
+    override = os.environ.get("LLM_TIMEOUT", "")
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            log.warning("Ignoring invalid LLM_TIMEOUT=%r", override)
+    is_local = not base_url.startswith("https://")
+    return _LOCAL_TIMEOUT if is_local else _TIMEOUT
+
 
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
@@ -73,6 +92,18 @@ _RATE_LIMIT_BASE_WAIT = 10
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+# Reasoning models (Qwen3, DeepSeek-R1, gpt-oss, …) spend the completion budget
+# on hidden reasoning tokens before emitting a single visible character. When the
+# budget runs out mid-thought the API still returns HTTP 200 — but with an EMPTY
+# content string and finish_reason="length". Callers then "successfully" parse
+# nothing, which is how a local Qwen3 run silently scored every job 0.
+#
+# Neither `/no_think` nor `chat_template_kwargs={"enable_thinking": False}`
+# suppresses this on Qwen3.8 (verified against LM Studio 0.4.23) — the only
+# reliable fix is a bigger budget, so escalate and retry.
+_EMPTY_RETRY_MULTIPLIER = 4
+_MAX_TOKENS_CEILING = 8192
 
 
 class LLMClient:
@@ -88,7 +119,8 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        self.timeout = _resolve_timeout(base_url)
+        self._client = httpx.Client(timeout=self.timeout)
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
@@ -100,7 +132,7 @@ class LLMClient:
         messages: list[dict],
         temperature: float,
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str, bool]:
         """Call the native Gemini generateContent API.
 
         Used automatically when the OpenAI-compat endpoint returns 403,
@@ -108,6 +140,10 @@ class LLMClient:
 
         Converts OpenAI-style messages to Gemini's contents/systemInstruction
         format transparently.
+
+        Returns:
+            (text, truncated) — truncated is True when the model ran out of
+            output budget, in which case text may be empty.
         """
         contents: list[dict] = []
         system_parts: list[dict] = []
@@ -142,7 +178,13 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        candidate = (data.get("candidates") or [{}])[0]
+        truncated = candidate.get("finishReason") == "MAX_TOKENS"
+        # A thinking model that exhausts its budget returns a candidate with no
+        # parts at all, so index defensively rather than KeyError-ing.
+        parts = (candidate.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts)
+        return text, truncated
 
     # -- OpenAI-compat API --------------------------------------------------
 
@@ -151,8 +193,14 @@ class LLMClient:
         messages: list[dict],
         temperature: float,
         max_tokens: int,
-    ) -> str:
-        """Call the OpenAI-compatible endpoint."""
+    ) -> tuple[str, bool]:
+        """Call the OpenAI-compatible endpoint.
+
+        Returns:
+            (content, truncated) — truncated is True when finish_reason is
+            "length", in which case content may be empty (see the module-level
+            note on reasoning models).
+        """
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -178,10 +226,12 @@ class LLMClient:
         return self._handle_compat_response(resp)
 
     @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
+    def _handle_compat_response(resp: httpx.Response) -> tuple[str, bool]:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        choice = (data.get("choices") or [{}])[0]
+        truncated = choice.get("finish_reason") == "length"
+        return (choice.get("message", {}).get("content") or ""), truncated
 
     # -- public API ---------------------------------------------------------
 
@@ -199,13 +249,34 @@ class LLMClient:
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
 
+        effective_max = max_tokens
+
         for attempt in range(_MAX_RETRIES):
             try:
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
+                    text, truncated = self._chat_native_gemini(messages, temperature, effective_max)
+                else:
+                    text, truncated = self._chat_compat(messages, temperature, effective_max)
 
-                return self._chat_compat(messages, temperature, max_tokens)
+                # Reasoning model burned the whole budget before saying anything.
+                if truncated and not text.strip():
+                    if effective_max < _MAX_TOKENS_CEILING:
+                        effective_max = min(effective_max * _EMPTY_RETRY_MULTIPLIER, _MAX_TOKENS_CEILING)
+                        log.warning(
+                            "Model '%s' returned empty content with finish_reason=length — "
+                            "reasoning tokens consumed the entire budget. "
+                            "Retrying with max_tokens=%d.",
+                            self.model, effective_max,
+                        )
+                        continue
+                    raise RuntimeError(
+                        f"Model '{self.model}' produced no content within "
+                        f"{effective_max} tokens (all spent on reasoning). "
+                        f"Use a non-reasoning model or shorten the prompt."
+                    )
+
+                return text
 
             except _GeminiCompatForbidden as exc:
                 # Model not available on OpenAI-compat layer — switch to native.
@@ -218,7 +289,8 @@ class LLMClient:
                 self._use_native_gemini = True
                 # Retry immediately with native — don't count as a rate-limit wait
                 try:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
+                    text, _ = self._chat_native_gemini(messages, temperature, effective_max)
+                    return text
                 except httpx.HTTPStatusError as native_exc:
                     raise RuntimeError(
                         f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
@@ -294,4 +366,5 @@ def get_client() -> LLMClient:
         base_url, model, api_key = _detect_provider()
         log.info("LLM provider: %s  model: %s", base_url, model)
         _instance = LLMClient(base_url, model, api_key)
+        log.info("LLM request timeout: %.0fs", _instance.timeout)
     return _instance

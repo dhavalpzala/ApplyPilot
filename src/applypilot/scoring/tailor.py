@@ -29,6 +29,10 @@ from applypilot.scoring.validator import (
 
 log = logging.getLogger(__name__)
 
+# A resume was produced and saved. "approved_with_judge_warning" counts: the
+# validator passed and only the softer LLM judge objected.
+_SUCCESS_STATUSES = frozenset({"approved", "approved_with_judge_warning"})
+
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 
@@ -108,13 +112,17 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 ## HARD RULES:
 - Do NOT invent work, companies, degrees, or certifications
 - Do NOT change real numbers ({metrics_str})
-- Preserved companies: {companies_str} -- names stay as-is
+- EVERY one of these companies must appear as its own "experience" entry, with the
+  name spelled exactly as given, in the "header" field ("Title at Company"):
+  {companies_str}
+  Dropping or merging any of them is a validation failure. Shorten bullets to fit,
+  never delete a role.
 - Preserved school: {school}
 - Must fit 1 page.
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}},{{"header":"Title at Older Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -326,7 +334,8 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    # 2048 leaves room for a reasoning model's hidden tokens ahead of VERDICT:.
+    response = client.chat(messages, max_tokens=2048, temperature=0.1)
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -533,6 +542,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "site": job["site"],
                 "status": report["status"],
                 "attempts": report["attempts"],
+                "validator": report.get("validator"),
+                "judge": report.get("judge"),
             }
         except Exception as e:
             result = {
@@ -555,11 +566,20 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             result["title"][:40],
         )
 
+        # Surface WHY it failed — otherwise a rejected resume is undebuggable
+        # without re-running the model by hand.
+        if result.get("status") not in _SUCCESS_STATUSES:
+            validator = result.get("validator") or {}
+            for err in validator.get("errors", []):
+                log.warning("    validator: %s", err)
+            judge = result.get("judge") or {}
+            if not judge.get("passed", True) and judge.get("issues") not in (None, "none"):
+                log.warning("    judge: %s", str(judge["issues"])[:300])
+
     # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:
-        if r["status"] in _success_statuses:
+        if r["status"] in _SUCCESS_STATUSES:
             conn.execute(
                 "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
                 "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",

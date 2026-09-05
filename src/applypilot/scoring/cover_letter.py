@@ -165,7 +165,8 @@ def generate_cover_letter(
             )},
         ]
 
-        letter = client.chat(messages, max_tokens=1024, temperature=0.7)
+        # 3072: the letter itself is ~500 tokens, the rest is reasoning headroom.
+        letter = client.chat(messages, max_tokens=3072, temperature=0.7)
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
         letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 

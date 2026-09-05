@@ -5,6 +5,32 @@ All notable changes to ApplyPilot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Reasoning models silently scored every job 0** - models like Qwen3 spend their
+  completion budget on hidden reasoning tokens before emitting any visible text. With
+  `max_tokens=512` the budget was exhausted mid-thought, returning HTTP 200 with an empty
+  `content` and `finish_reason="length"`, which parsed as score 0. `llm.py` now detects
+  truncated-empty responses and retries with a 4x larger budget (up to 8192) instead of
+  returning nothing. Neither `/no_think` nor `chat_template_kwargs.enable_thinking=False`
+  suppresses reasoning on Qwen3.8, so a larger budget is the only reliable fix.
+- **LLM failures poisoned the score queue** - `run_scoring()` wrote `fit_score=0` on any
+  LLM exception. Since the pending query selects `fit_score IS NULL`, those rows were
+  permanently skipped and reported as "scored". Transport failures now leave `fit_score`
+  NULL so the next run retries them, and log a warning with the count.
+- **Timeouts against local models** - the 120s timeout was tuned for hosted APIs; a local
+  27B reasoning model needs several minutes per request, and retrying doesn't help because
+  the model is simply still working. Local endpoints now default to 900s, overridable with
+  `LLM_TIMEOUT`.
+- **Crash on Gemini `MAX_TOKENS`** - a thinking model that exhausted its budget returned a
+  candidate with no `parts`, raising `KeyError`. The native Gemini path now indexes
+  defensively.
+
+### Changed
+- Raised default output budgets for reasoning headroom: score 512 -> 2048, tailor judge
+  512 -> 2048, cover letter 1024 -> 3072.
+
 ## [0.2.0] - 2026-02-17
 
 ### Added

@@ -78,7 +78,10 @@ def score_job(resume_text: str, job: dict) -> dict:
         job: Job dict with keys: title, site, location, full_description.
 
     Returns:
-        {"score": int, "keywords": str, "reasoning": str}
+        {"score": int, "keywords": str, "reasoning": str}. On an LLM transport
+        failure the dict also carries "llm_error": True, which tells the caller
+        to leave fit_score NULL rather than writing a 0 the queue would treat
+        as "already scored".
     """
     job_text = (
         f"TITLE: {job['title']}\n"
@@ -94,11 +97,14 @@ def score_job(resume_text: str, job: dict) -> dict:
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        # 2048, not 512: reasoning models (Qwen3 et al.) spend hundreds of hidden
+        # tokens before the SCORE: line. llm.py escalates automatically if this
+        # still isn't enough, but a right-sized budget avoids the wasted call.
+        response = client.chat(messages, max_tokens=2048, temperature=0.2)
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}", "llm_error": True}
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
@@ -135,6 +141,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     t0 = time.time()
     completed = 0
     errors = 0
+    llm_errors = 0
     results: list[dict] = []
 
     for job in jobs:
@@ -144,6 +151,8 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
         if result["score"] == 0:
             errors += 1
+        if result.get("llm_error"):
+            llm_errors += 1
 
         results.append(result)
 
@@ -152,17 +161,29 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
 
-    # Write scores to DB
+    # Write scores to DB. Rows whose LLM call failed outright are skipped so
+    # fit_score stays NULL and the next run picks them up again.
     now = datetime.now(timezone.utc).isoformat()
+    written = 0
     for r in results:
+        if r.get("llm_error"):
+            continue
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
         )
+        written += 1
     conn.commit()
 
+    if llm_errors:
+        log.warning(
+            "%d/%d jobs left unscored due to LLM errors — they stay in the queue "
+            "and will be retried on the next `applypilot run score`.",
+            llm_errors, len(results),
+        )
+
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", written, elapsed, written / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""

@@ -126,8 +126,19 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     # Skills: check for fabrication (always enforced)
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
+        # FABRICATION_WATCHLIST is a generic "wrong stack" heuristic, but the
+        # user's own profile is the authority on what is real — a candidate who
+        # genuinely lists Angular must never be told they fabricated it. Without
+        # this subtraction the prompt and the validator contradict each other
+        # (_build_tailor_prompt advertises skills_boundary as real skills) and
+        # tailoring fails every retry, unwinnably.
+        allowed_skills = _build_skills_set(profile)
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
+                continue
+            # Substring match in both directions: "vue" must not fire for a
+            # declared "vue.js", and vice versa.
+            if any(fake in real or real in fake for real in allowed_skills):
                 continue
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
