@@ -73,6 +73,11 @@ _TIMEOUT = 120  # seconds — hosted APIs
 _LOCAL_TIMEOUT = 900  # seconds
 
 
+def _is_local_endpoint(base_url: str) -> bool:
+    """True for an endpoint served from this machine rather than a vendor API."""
+    return not base_url.startswith("https://")
+
+
 def _resolve_timeout(base_url: str) -> float:
     """Pick a request timeout: LLM_TIMEOUT override, else local vs hosted default."""
     override = os.environ.get("LLM_TIMEOUT", "")
@@ -81,13 +86,34 @@ def _resolve_timeout(base_url: str) -> float:
             return float(override)
         except ValueError:
             log.warning("Ignoring invalid LLM_TIMEOUT=%r", override)
-    is_local = not base_url.startswith("https://")
-    return _LOCAL_TIMEOUT if is_local else _TIMEOUT
+    return _LOCAL_TIMEOUT if _is_local_endpoint(base_url) else _TIMEOUT
 
 
 # Base wait on first 429/503 (doubles each retry, caps at 60s).
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
 _RATE_LIMIT_BASE_WAIT = 10
+
+# Statuses worth retrying: 429 rate limit, 503 model loading/overloaded.
+_RETRYABLE_STATUSES = (429, 503)
+
+
+def _backoff_wait(attempt: int, retry_after: str | None = None) -> float:
+    """Seconds to wait before retry `attempt` (0-indexed).
+
+    Honours a server-supplied Retry-After when it parses, otherwise falls back
+    to _RATE_LIMIT_BASE_WAIT doubling per attempt and capping at 60s.
+    """
+    if retry_after:
+        try:
+            return float(retry_after)
+        except (ValueError, TypeError):
+            pass
+    return min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+
+
+def _retry_after_of(resp: httpx.Response) -> str | None:
+    """Pull whichever rate-limit reset header this provider happens to send."""
+    return resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-Requests")
 
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -300,20 +326,8 @@ class LLMClient:
 
             except httpx.HTTPStatusError as exc:
                 resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
-                    # Respect Retry-After header if provided (Gemini sends this).
-                    retry_after = (
-                        resp.headers.get("Retry-After")
-                        or resp.headers.get("X-RateLimit-Reset-Requests")
-                    )
-                    if retry_after:
-                        try:
-                            wait = float(retry_after)
-                        except (ValueError, TypeError):
-                            wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
-                    else:
-                        wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
-
+                if resp.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
+                    wait = _backoff_wait(attempt, _retry_after_of(resp))
                     log.warning(
                         "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
                         "Tip: Gemini free tier = 15 RPM. Consider a paid account "
@@ -326,7 +340,7 @@ class LLMClient:
 
             except httpx.TimeoutException:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+                    wait = _backoff_wait(attempt)
                     log.warning(
                         "LLM request timed out, retrying in %ds (attempt %d/%d)",
                         wait, attempt + 1, _MAX_RETRIES,
@@ -340,6 +354,96 @@ class LLMClient:
     def ask(self, prompt: str, **kwargs) -> str:
         """Convenience: single user prompt -> assistant response."""
         return self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    # -- tool calling -------------------------------------------------------
+
+    def chat_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+    ) -> dict:
+        """Send a tool-enabled chat completion and return the assistant message.
+
+        Unlike chat(), which returns only text, this preserves tool_calls — the
+        agent loop in apply/local_agent.py needs both.
+
+        Args:
+            messages: OpenAI-format history. May include role="tool" entries.
+            tools: OpenAI function-calling schemas.
+            temperature: Sampling temperature.
+            max_tokens: Output budget. Tool calls are short; the default is
+                deliberately smaller than chat()'s.
+
+        Returns:
+            {"content": str, "tool_calls": list[dict]} — tool_calls is [] when
+            the model replied with plain text instead.
+
+        Raises:
+            RuntimeError: If the provider is on the native Gemini path, which
+                uses a different function-calling wire format we don't support.
+        """
+        if self._use_native_gemini:
+            raise RuntimeError(
+                "Tool calling is not supported on the native Gemini API path. "
+                "Use an OpenAI-compatible provider (LM Studio, OpenAI) for the "
+                "local apply driver."
+            )
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = self._client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                message = (data.get("choices") or [{}])[0].get("message", {}) or {}
+                return {
+                    "content": message.get("content") or "",
+                    "tool_calls": message.get("tool_calls") or [],
+                }
+
+            except httpx.HTTPStatusError as exc:
+                resp = exc.response
+                if resp.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES - 1:
+                    wait = _backoff_wait(attempt, _retry_after_of(resp))
+                    log.warning(
+                        "LLM rate limited (HTTP %s) on tool call. "
+                        "Waiting %ds before retry %d/%d.",
+                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+
+            except httpx.TimeoutException:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _backoff_wait(attempt)
+                    log.warning(
+                        "LLM tool call timed out, retrying in %ds (attempt %d/%d)",
+                        wait, attempt + 1, _MAX_RETRIES,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+
+        raise RuntimeError("LLM tool request failed after all retries")
 
     def close(self) -> None:
         self._client.close()

@@ -147,7 +147,11 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    driver: str = typer.Option(
+        "local", "--driver",
+        help="Apply driver: 'local' (Playwright + local LLM) or 'claude' (Claude Code CLI).",
+    ),
+    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name (--driver claude only)."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -186,8 +190,18 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
-    check_tier(3, "auto-apply")
+    from applypilot.config import APPLY_DRIVERS
+
+    driver = driver.lower().strip()
+    if driver not in APPLY_DRIVERS:
+        console.print(
+            f"[red]Unknown --driver {driver!r}.[/red] "
+            f"Choose one of: {', '.join(APPLY_DRIVERS)}."
+        )
+        raise typer.Exit(code=1)
+
+    # Check 1: Tier 3 required (Chrome, plus Claude Code CLI for --driver claude)
+    check_tier(3, "auto-apply", driver=driver)
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -216,18 +230,26 @@ def apply(
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        prompt_file = gen_prompt(target, min_score=min_score, model=model, driver=driver)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        if driver == "local":
+            console.print(
+                "\n[dim]This is the local-driver prompt (solve_captcha tool instead of "
+                "inline JS, plus the local tool-surface overrides).\n"
+                "It is consumed in-process by the agent loop, so there is no "
+                "command to run manually — inspect the file.[/dim]"
+            )
+        else:
+            mcp_path = _profile_path.parent / ".mcp-apply-0.json"
+            console.print("\n[bold]Run manually:[/bold]")
+            console.print(
+                f"  claude --model {model} -p "
+                f"--mcp-config {mcp_path} "
+                f"--permission-mode bypassPermissions < {prompt_file}"
+            )
         return
 
     from applypilot.apply.launcher import main as apply_main
@@ -237,7 +259,9 @@ def apply(
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Driver:   {driver}")
+    if driver == "claude":
+        console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -253,6 +277,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        driver=driver,
     )
 
 
@@ -380,29 +405,50 @@ def doctor() -> None:
 
     # --- Tier 2 checks ---
     import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
-    has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
-    elif has_openai:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
-    else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+
+    # Ask llm.py which provider it will actually use rather than re-deriving the
+    # precedence here — LLM_URL overrides the API keys, so a hand-rolled
+    # "Gemini first" check reports the wrong provider whenever both are set.
+    from applypilot.llm import _detect_provider
+    try:
+        llm_base, llm_model, _ = _detect_provider()
+        if "generativelanguage.googleapis.com" in llm_base:
+            provider = f"Gemini ({llm_model})"
+        elif "api.openai.com" in llm_base:
+            provider = f"OpenAI ({llm_model})"
+        else:
+            provider = f"Local: {llm_base} ({llm_model})"
+        results.append(("LLM provider", ok_mark, provider))
+    except RuntimeError:
+        llm_base = ""
+        results.append(("LLM provider", fail_mark,
+                        "Set GEMINI_API_KEY or LLM_URL in ~/.applypilot/.env (run 'applypilot init')"))
+
+    # Local endpoints are a process on this machine that may simply not be
+    # running. Probe it here rather than discovering it mid-application.
+    if llm_base and "generativelanguage" not in llm_base and "api.openai.com" not in llm_base:
+        try:
+            import httpx
+            models = httpx.get(f"{llm_base}/models", timeout=3).json().get("data", [])
+            ids = [m.get("id") for m in models]
+            if llm_model in ids:
+                results.append(("Local LLM reachable", ok_mark, f"{len(ids)} model(s) loaded"))
+            else:
+                results.append(("Local LLM reachable", warn_mark,
+                                f"Serving {ids}, but LLM_MODEL={llm_model} is not among them"))
+        except Exception as exc:  # noqa: BLE001 - any failure means unreachable
+            results.append(("Local LLM reachable", fail_mark,
+                            f"No response from {llm_base} ({type(exc).__name__}) — is LM Studio running?"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
+    # Claude Code CLI — only needed for --driver claude; the default local
+    # driver talks to the LLM endpoint above and drives Chrome from Python.
     claude_bin = shutil.which("claude")
     if claude_bin:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Claude Code CLI", "[dim]optional[/dim]",
+                        "Only needed for --driver claude; default --driver local does not use it"))
 
     # Chrome
     try:
@@ -412,13 +458,13 @@ def doctor() -> None:
         results.append(("Chrome/Chromium", fail_mark,
                         "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
 
-    # Node.js / npx (for Playwright MCP)
+    # Node.js / npx — only the Claude driver spawns the Playwright MCP server.
     npx_bin = shutil.which("npx")
     if npx_bin:
         results.append(("Node.js (npx)", ok_mark, npx_bin))
     else:
-        results.append(("Node.js (npx)", fail_mark,
-                        "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+        results.append(("Node.js (npx)", "[dim]optional[/dim]",
+                        "Only needed for --driver claude (Playwright MCP server)"))
 
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")
@@ -446,9 +492,9 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome)[/dim]")
 
     console.print()
 

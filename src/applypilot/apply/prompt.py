@@ -214,14 +214,34 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_captcha_section() -> str:
+def _build_captcha_section(native: bool = False) -> str:
     """Build the CAPTCHA detection and solving instructions.
 
     Reads the CapSolver API key from environment. The CAPTCHA section
     contains no personal data -- it's the same for every user.
+
+    Args:
+        native: When True, emit a three-line summary instead of the full
+            JavaScript flow. The local driver implements detect/solve/inject
+            as a Python `solve_captcha` tool (apply/tools.py), so shipping the
+            JS would be both redundant and a third of the system prompt --
+            which is re-processed on every turn of the agent loop.
     """
     config.load_env()
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+
+    if native:
+        if not capsolver_key:
+            return ("== CAPTCHA ==\n"
+                    "CAPSOLVER_API_KEY is not configured. If a CAPTCHA blocks the "
+                    "application, call report_result with status CAPTCHA.\n")
+        return ("== CAPTCHA ==\n"
+                "If a CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha), call the "
+                "solve_captcha tool. It takes no arguments and handles detection, solving via "
+                "CapSolver, and token injection for you.\n"
+                "After it returns, take a fresh snapshot. If the widget is gone, continue; some "
+                "sites still need a Submit/Verify click. If solve_captcha reports it could not "
+                "solve, call report_result with status CAPTCHA.\n")
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
@@ -419,7 +439,8 @@ If CapSolver genuinely failed (errorId > 0):
 
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+                 dry_run: bool = False,
+                 native_captcha: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -431,6 +452,8 @@ def build_prompt(job: dict, tailored_resume: str,
         tailored_resume: Plain-text content of the tailored resume.
         cover_letter: Optional plain-text cover letter content.
         dry_run: If True, tell the agent not to click Submit.
+        native_captcha: If True, replace the inline CapSolver JavaScript with a
+            short pointer at the `solve_captcha` tool. Used by the local driver.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -482,7 +505,7 @@ def build_prompt(job: dict, tailored_resume: str,
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
-    captcha_section = _build_captcha_section()
+    captcha_section = _build_captcha_section(native=native_captcha)
 
     # Cover letter fallback text
     city = personal.get("city", "the area")
@@ -622,3 +645,61 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 Stop immediately. Output your RESULT code. Do not loop."""
 
     return prompt
+
+
+def build_local_addendum(dry_run: bool = False) -> str:
+    """Overrides appended after build_prompt() for the local driver.
+
+    The base prompt was written for the Claude CLI talking to @playwright/mcp.
+    The local driver keeps every eligibility, salary, location and safety rule
+    from it, but the tool surface differs in three ways. These instructions come
+    last so they take precedence over anything above that contradicts them.
+
+    Args:
+        dry_run: If True, restate that submission is blocked in code.
+
+    Returns:
+        Addendum text to append to the base prompt.
+    """
+    dry_run_note = ""
+    if dry_run:
+        dry_run_note = (
+            "\nDRY RUN IS ACTIVE. Clicks on Submit/Apply buttons are blocked in code and will "
+            "return 'DRY RUN: submit blocked'. That is the expected, successful end state -- "
+            "when you see it, call report_result with status APPLIED. Fill the form out fully "
+            "first, exactly as you would for a real application.\n"
+        )
+
+    return f"""
+================================================================
+== LOCAL DRIVER OVERRIDES (these take precedence over the above) ==
+================================================================
+
+1. CAPTCHAS. Ignore any JavaScript in the CAPTCHA section above. Call the
+   solve_captcha tool instead -- no arguments. It performs detection, the
+   CapSolver API round-trip and token injection in one step.
+
+2. NO GMAIL. There are no gmail tools on this driver. Skip any instruction
+   above about sending, searching or reading email. If an application demands
+   email verification you cannot complete, call report_result with
+   status FAILED and reason unsafe_verification.
+
+3. FINISHING. Call the report_result tool with your final status. Do not just
+   print text -- a tool call is how the session ends. Printing a RESULT: line
+   also works as a fallback, but the tool is preferred.
+
+4. REFS GO STALE. Element refs (e12, e40, ...) belong to the snapshot they came
+   from. After any navigation, click that changes the page, or form submission,
+   call browser_snapshot again before using a ref. If a tool replies that a ref
+   is stale or not found, re-snapshot -- do not guess another ref.
+
+5. SNAPSHOTS ARE FILTERED. browser_snapshot returns only interactive and
+   informative elements; layout wrappers are hidden and a count of them is
+   shown. If you cannot find an element you expect, it is more likely below the
+   fold than hidden -- scroll with browser_evaluate
+   (function: () => window.scrollBy(0, 800)) and snapshot again.
+
+6. BE DECISIVE. Every turn is slow on a local model. Prefer browser_fill_form
+   with several fields over repeated browser_type calls, and do not re-snapshot
+   when nothing has changed.
+{dry_run_note}"""

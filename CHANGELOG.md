@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Local apply driver — auto-apply without the Claude Code CLI.** `applypilot apply` now
+  defaults to `--driver local`, which runs the apply agent in-process against any
+  OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp) and drives Chrome directly with
+  Playwright Python. The Claude path is unchanged and still available via `--driver claude`.
+  This removes node/npx and the `@playwright/mcp` server from the auto-apply path entirely,
+  so no `npm_config_registry` / `PLAYWRIGHT_MCP_CLI` workarounds are needed, and applying
+  costs nothing per job.
+  - `apply/tools.py` reimplements the Playwright MCP tool surface (`browser_snapshot`,
+    `browser_click`, `browser_fill_form`, `browser_file_upload`, …) on top of
+    `page.aria_snapshot(mode="ai")` and `aria-ref=` locators, so `apply/prompt.py` is reused
+    as-is. No new dependencies — Playwright was already required.
+  - `apply/local_agent.py` runs the tool-call loop, with `run_job_local()` mirroring
+    `run_job()`'s signature and status vocabulary so `worker_loop()` just picks one.
+  - `llm.py` gains `chat_tools()`, which preserves `tool_calls` (`chat()` discarded them).
+  - CAPTCHAs are solved by a native Python `solve_captcha` tool instead of the agent
+    executing ~190 lines of CapSolver JavaScript. Besides being far more reliable on a small
+    model, this cuts the system prompt — re-processed every turn — by 37%.
+  - `--dry-run` is now enforced in code: `browser_click` refuses submit-like elements rather
+    than relying on the agent to obey the instruction.
+  - Snapshots are filtered to interactive and informative nodes (measured 56–92% smaller on
+    representative pages, with every actionable ref preserved) and superseded snapshots are
+    pruned from history. Both are load-bearing: local latency measured ~9s at 3.5k prompt
+    tokens but ~117s at 41k, and unfiltered ATS snapshots land in that upper band.
+
 ### Fixed
+- **`doctor` reported the wrong LLM provider.** It checked `GEMINI_API_KEY` before `LLM_URL`,
+  while `llm.py::_detect_provider` gives `LLM_URL` precedence over both API keys. With a
+  Gemini key and a local URL both set — the documented local-mode setup — doctor claimed
+  Gemini while every stage actually ran on the local endpoint. It now asks
+  `_detect_provider()` directly, and probes local endpoints for reachability and for whether
+  `LLM_MODEL` is among the models actually being served.
+- **Tier 3 was unreachable without the Claude Code CLI.** `get_tier()`/`check_tier()` are now
+  driver-aware, so the local driver needs only an LLM provider plus Chrome. `doctor` reports
+  the Claude CLI and `npx` as optional, needed only for `--driver claude`.
 - **Reasoning models silently scored every job 0** - models like Qwen3 spend their
   completion budget on hidden reasoning tokens before emitting any visible text. With
   `max_tokens=512` the budget was exhausted mid-thought, returning HTTP 200 with an empty

@@ -89,12 +89,37 @@ Each stage is independent. Run them all or pick what you need.
 | Component | Required For | Details |
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
-| Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
+| Gemini API key *or* a local model | Scoring, tailoring, cover letters, auto-apply | Free tier (15 RPM / 1M tokens/day) is enough; see "Running fully local" below |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
+| Node.js 18+ | Auto-apply with `--driver claude` only | Needed for `npx` to run the Playwright MCP server |
+| Claude Code CLI | Auto-apply with `--driver claude` only | Install from [claude.ai/code](https://claude.ai/code) |
 
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (LM Studio/Ollama/llama.cpp) are also supported.
+
+### Running fully local
+
+Every stage, including auto-apply, can run against a local OpenAI-compatible endpoint — no API keys, no per-application cost, and nothing leaves your machine. Point `.env` at your server:
+
+```bash
+LLM_URL=http://localhost:1234/v1          # LM Studio's default
+LLM_MODEL=gemma-4-26b-a4b-it-qat-mlx      # must match /v1/models exactly
+```
+
+`LLM_URL` takes precedence over `GEMINI_API_KEY` and `OPENAI_API_KEY`, so a local URL wins even when a key is also present. Run `applypilot doctor` to confirm which provider is actually selected and that the endpoint is reachable.
+
+Auto-apply then uses the default `--driver local`, which drives Chrome with Playwright directly from Python — no Claude Code CLI, no Node.js, no MCP server:
+
+```bash
+applypilot apply --dry-run     # fills forms, never submits (enforced in code)
+applypilot apply --limit 1
+applypilot apply --driver claude --limit 1   # the Claude Code path, still available
+```
+
+Two things to know about local mode:
+
+- **Pick a non-reasoning model.** Reasoning models spend their output budget on hidden tokens before saying anything, which makes every turn several times slower.
+- **Latency scales with prompt size,** and the apply agent takes 10-20 turns. A typical application runs a few minutes rather than seconds.
+
 
 ### Optional
 
@@ -117,7 +142,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_URL` / `LLM_MODEL` (local models), `LLM_TIMEOUT`, `CAPSOLVER_API_KEY` (optional).
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)

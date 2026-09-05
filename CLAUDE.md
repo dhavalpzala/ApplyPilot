@@ -23,6 +23,7 @@ ruff format src/
 applypilot run --dry-run             # prints stage plan, touches nothing
 applypilot run score --min-score 8   # single stage
 applypilot apply --dry-run           # drives the browser but never clicks Submit
+applypilot apply --driver claude     # use the Claude Code CLI instead of the local model
 applypilot apply --gen --url URL     # writes the agent prompt to a file for inspection
 applypilot status                    # per-stage row counts from SQLite
 ```
@@ -47,7 +48,7 @@ discover → enrich → score → tailor → cover → pdf → apply
 | tailor | `scoring/tailor.py` | `tailored_resume_path, tailor_attempts` | yes |
 | cover | `scoring/cover_letter.py` | `cover_letter_path, cover_attempts` | yes |
 | pdf | `scoring/pdf.py` | rewrites `tailored_resume_path` `.txt`→`.pdf` | no |
-| apply | `apply/launcher.py` | `apply_status, applied_at, apply_attempts, …` | Claude Code CLI |
+| apply | `apply/launcher.py` | `apply_status, applied_at, apply_attempts, …` | local model (default) or Claude Code CLI |
 
 Note: directory names are `discovery/`, `enrichment/`, `scoring/`, `apply/`, `wizard/`. The "Project Structure" section of `CONTRIBUTING.md` is stale (it lists `discover/`, `score/`, `tailor/`, `utils/`, `docs/`, none of which exist), as are its `applypilot discover --employer/--site` examples — no `discover` subcommand exists.
 
@@ -69,25 +70,36 @@ Stage runners swallow exceptions into `{"status": "error: …"}` rather than rai
 
 ### LLM access (`llm.py`)
 
-One `LLMClient` singleton via `get_client()`; never instantiate providers elsewhere. Provider is detected from env **at call time** (so `load_env()` in `_bootstrap()` is visible): `GEMINI_API_KEY` → `OPENAI_API_KEY` → `LLM_URL`, with `LLM_MODEL` overriding the model. Two quirks worth knowing before changing this file:
+One `LLMClient` singleton via `get_client()`; never instantiate providers elsewhere. Provider is detected from env **at call time** (so `load_env()` in `_bootstrap()` is visible): `GEMINI_API_KEY` → `OPENAI_API_KEY` → `LLM_URL`, with `LLM_MODEL` overriding the model. Note the ordering is misleading: setting `LLM_URL` wins over *both* API keys, because the key branches are guarded by `and not local_url`. Two methods: `chat()` returns text only; `chat_tools()` preserves `tool_calls` and is what the local apply driver runs on (compat endpoints only — the native Gemini path raises). Two quirks worth knowing before changing this file:
 - Gemini starts on the OpenAI-compat shim; a 403 (typical for preview/experimental models) flips the client to the native `generateContent` API for the rest of the process.
 - 429/503/timeout retry up to 5 times honouring `Retry-After`, base 10s doubling to 60s — tuned for the Gemini free tier's 15 RPM.
 
 ### Apply stage (`apply/`)
 
-Not Playwright-driven from Python. Each worker:
-1. `chrome.py` launches an isolated Chrome with `--remote-debugging-port=BASE_CDP_PORT + worker_id` (9222+) and a cloned user-data dir.
+Two interchangeable drivers behind one seam: `run_job(job, port, worker_id, model, dry_run) -> (status, duration_ms)`. `worker_loop()` picks one via `--driver` and everything else — job claiming, retry classification, the dashboard — is shared.
+
+**`--driver local` (default).** Fully in-process, no subprocess:
+1. `chrome.py` launches the same isolated Chrome with `--remote-debugging-port=BASE_CDP_PORT + worker_id`.
+2. `local_agent.py::run_job_local()` attaches with `sync_playwright().chromium.connect_over_cdp(...)` and runs a tool-call loop against `LLMClient.chat_tools()` (any OpenAI-compatible endpoint; LM Studio in practice).
+3. `tools.py` implements the Playwright-MCP tool surface in Python — `browser_snapshot` wraps `page.aria_snapshot(mode="ai")` and every ref resolves via `page.locator("aria-ref=eN")`. Tool names match the ones `prompt.py` already references, which is why the prompt is reused unchanged.
+4. Termination is the `report_result` tool, with the `RESULT:` text grep as fallback.
+
+Two things in this path are performance-critical, not cosmetic: `tools.filter_snapshot()` (drops layout nodes) and `local_agent._prune_history()` (supersedes stale snapshots). Local latency scales with prompt size — measured ~9s at 3.5k tokens vs ~117s at 41k — so letting raw snapshots accumulate makes an application take ~40 minutes instead of ~5. `dry_run` is enforced in `tools.py`, not the prompt.
+
+**`--driver claude`.** The original path. Each worker:
+1. `chrome.py` launches Chrome as above.
 2. `launcher.py` writes `~/.applypilot/.mcp-apply-<worker_id>.json` pointing `@playwright/mcp` at that CDP port.
 3. It shells out to `claude -p --mcp-config … --permission-mode bypassPermissions --output-format stream-json`, pipes the prompt on stdin, and parses the JSON event stream for tool calls (dashboard updates), cost, and the final text.
-4. The agent's contract is a single `RESULT:` line — `APPLIED`, `EXPIRED`, `CAPTCHA`, `LOGIN_ISSUE`, or `FAILED:<reason>`. `run_job()` greps for it; no line means `failed:no_result_line`. If you change a result code in `apply/prompt.py`, update the parser and `PERMANENT_FAILURES`/`PERMANENT_PREFIXES` in `launcher.py`, which decide whether `apply_attempts` is bumped or slammed to 99 (never retry).
+
+The agent's contract either way is a single `RESULT:` line — `APPLIED`, `EXPIRED`, `CAPTCHA`, `LOGIN_ISSUE`, or `FAILED:<reason>`. `parse_result()` in `launcher.py` is shared by both drivers; no line means `failed:no_result_line`. If you change a result code in `apply/prompt.py`, update `parse_result()` and `PERMANENT_FAILURES`/`PERMANENT_PREFIXES`, which decide whether `apply_attempts` is bumped or slammed to 99 (never retry).
 
 `acquire_job()` claims rows under `BEGIN IMMEDIATE` and sets `apply_status='in_progress'` — that lock is how parallel workers avoid double-applying, and it must be released (`release_lock`) on every early-exit path.
 
-`apply/prompt.py` assembles the entire agent instruction set from `profile.json` + `searches.yaml`. It is long and prescriptive by design (eligibility gates, CAPTCHA/CapSolver flow, SSO refusal, safety refusals). Behaviour changes for the apply agent belong here, not in the launcher.
+`apply/prompt.py` assembles the entire agent instruction set from `profile.json` + `searches.yaml`. It is long and prescriptive by design (eligibility gates, CAPTCHA/CapSolver flow, SSO refusal, safety refusals). Behaviour changes for the apply agent belong here, not in the launcher. `build_prompt(native_captcha=True)` swaps the inline CapSolver JavaScript for a pointer at the `solve_captcha` tool, and `build_local_addendum()` appends the local driver's tool-surface overrides.
 
 ### Tier gating (`config.py`)
 
-`get_tier()` returns 1 (discovery), 2 (+ LLM key), or 3 (+ `claude` on PATH and Chrome found). Commands call `check_tier(n, feature)`, which exits with a rendered list of what's missing. `doctor` reports the same checks individually. Gate any new LLM-dependent command at tier 2 and any browser/agent command at tier 3.
+`get_tier(driver)` returns 1 (discovery), 2 (+ LLM key), or 3 (+ Chrome, and `claude` on PATH only when `driver == "claude"`). Commands call `check_tier(n, feature, driver=…)`, which exits with a rendered list of what's missing. `doctor` reports the same checks individually, deriving the LLM provider from `llm._detect_provider()` rather than re-implementing the precedence. Gate any new LLM-dependent command at tier 2 and any browser/agent command at tier 3.
 
 ## Conventions
 

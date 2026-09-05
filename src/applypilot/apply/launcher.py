@@ -211,8 +211,18 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
-    """Generate a prompt file and print the Claude CLI command for manual debugging.
+               model: str = "sonnet", worker_id: int = 0,
+               driver: str = config.DEFAULT_APPLY_DRIVER) -> Path | None:
+    """Generate a prompt file for manual debugging.
+
+    Args:
+        target_url: The job URL to build a prompt for.
+        min_score: Minimum fit_score threshold.
+        model: Claude model name (Claude driver only).
+        worker_id: Worker slot, decides the CDP port and MCP config path.
+        driver: Which driver's prompt to render. The local driver swaps the
+            inline CapSolver JavaScript for the solve_captcha tool and appends
+            the local tool-surface overrides, so the two differ substantially.
 
     Returns:
         Path to the generated prompt file, or None if no job found.
@@ -228,7 +238,11 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    is_local = driver == "local"
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text,
+                                     native_captcha=is_local)
+    if is_local:
+        prompt += "\n\n" + prompt_mod.build_local_addendum()
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -239,10 +253,11 @@ def gen_prompt(target_url: str, min_score: int = 7,
     prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
 
-    # Write MCP config for reference
-    port = BASE_CDP_PORT + worker_id
-    mcp_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+    # The MCP config is only meaningful to the Claude driver.
+    if not is_local:
+        port = BASE_CDP_PORT + worker_id
+        mcp_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+        mcp_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
 
     return prompt_file
 
@@ -462,40 +477,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
 
-        def _clean_reason(s: str) -> str:
-            return re.sub(r'[*`"]+$', '', s).strip()
-
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
-            if f"RESULT:{result_status}" in output:
-                add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
-                update_state(worker_id, status=result_status.lower(),
-                             last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
-
-        if "RESULT:FAILED" in output:
-            for out_line in output.split("\n"):
-                if "RESULT:FAILED" in out_line:
-                    reason = (
-                        out_line.split("RESULT:FAILED:")[-1].strip()
-                        if ":" in out_line[out_line.index("FAILED") + 6:]
-                        else "unknown"
-                    )
-                    reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
-                    if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
-                        update_state(worker_id, status=reason,
-                                     last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
-                    add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
-                    update_state(worker_id, status="failed",
-                                 last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
-
-        add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
-        update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
+        return parse_result(output, worker_id, job, elapsed), duration_ms
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
@@ -513,6 +495,67 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
+
+
+# ---------------------------------------------------------------------------
+# Result parsing
+# ---------------------------------------------------------------------------
+
+# Reasons that are really statuses in disguise — the agent sometimes reports
+# RESULT:FAILED:captcha instead of RESULT:CAPTCHA.
+PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
+
+
+def _clean_reason(s: str) -> str:
+    return re.sub(r'[*`"]+$', '', s).strip()
+
+
+def parse_result(output: str, worker_id: int, job: dict, elapsed: int) -> str:
+    """Extract the agent's RESULT: line from its output and update the dashboard.
+
+    Shared by both drivers: the Claude CLI path greps the assistant transcript,
+    the local path greps the model's plain-text turns. Keeping one parser keeps
+    the failure-code vocabulary in step with PERMANENT_FAILURES below.
+
+    Args:
+        output: Full concatenated agent text.
+        worker_id: Worker slot, for dashboard updates.
+        job: The job row, for event labels.
+        elapsed: Seconds the attempt took.
+
+    Returns:
+        'applied' | 'expired' | 'captcha' | 'login_issue' | 'failed:<reason>'
+    """
+    for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
+        if f"RESULT:{result_status}" in output:
+            add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
+            update_state(worker_id, status=result_status.lower(),
+                         last_action=f"{result_status} ({elapsed}s)")
+            return result_status.lower()
+
+    if "RESULT:FAILED" in output:
+        for out_line in output.split("\n"):
+            if "RESULT:FAILED" in out_line:
+                reason = (
+                    out_line.split("RESULT:FAILED:")[-1].strip()
+                    if ":" in out_line[out_line.index("FAILED") + 6:]
+                    else "unknown"
+                )
+                reason = _clean_reason(reason)
+                if reason in PROMOTE_TO_STATUS:
+                    add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
+                    update_state(worker_id, status=reason,
+                                 last_action=f"{reason.upper()} ({elapsed}s)")
+                    return reason
+                add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
+                update_state(worker_id, status="failed",
+                             last_action=f"FAILED: {reason[:25]}")
+                return f"failed:{reason}"
+        return "failed:unknown"
+
+    add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
+    update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
+    return "failed:no_result_line"
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +591,8 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False,
+                driver: str = config.DEFAULT_APPLY_DRIVER) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -557,12 +601,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Claude model name (ignored by the local driver).
         dry_run: Don't click Submit.
+        driver: 'local' (Playwright + local LLM) or 'claude' (Claude Code CLI).
 
     Returns:
         Tuple of (applied_count, failed_count).
     """
+    if driver == "local":
+        from applypilot.apply.local_agent import run_job_local
+        run_fn = run_job_local
+    else:
+        run_fn = run_job
+
     applied = 0
     failed = 0
     continuous = limit == 0
@@ -601,7 +652,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+            result, duration_ms = run_fn(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
 
             if result == "skipped":
@@ -653,7 +704,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1,
+         driver: str = config.DEFAULT_APPLY_DRIVER) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -661,11 +713,12 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Claude model name (ignored by the local driver).
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
+        driver: 'local' (Playwright + local LLM) or 'claude' (Claude Code CLI).
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -687,6 +740,15 @@ def main(limit: int = 1, target_url: str | None = None,
 
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
     console.print(f"Launching apply pipeline ({mode_label}, {worker_label}, poll every {POLL_INTERVAL}s)...")
+    if driver == "local":
+        from applypilot.llm import _detect_provider
+        try:
+            _, llm_model, _ = _detect_provider()
+        except RuntimeError:
+            llm_model = "unconfigured"
+        console.print(f"[dim]Driver: local (Playwright + {llm_model})[/dim]")
+    else:
+        console.print(f"[dim]Driver: claude ({model})[/dim]")
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
     # Double Ctrl+C handler
@@ -737,6 +799,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    driver=driver,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -760,6 +823,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            driver=driver,
                         ): i
                         for i in range(workers)
                     }

@@ -167,6 +167,9 @@ DEFAULTS = {
     "max_tailor_attempts": 5,
     "poll_interval": 60,
     "apply_timeout": 300,
+    # The local driver runs many turns against a local model at roughly
+    # 10-20s each, so a whole application takes minutes, not seconds.
+    "local_apply_timeout": 1200,
     "viewport": "1280x900",
 }
 
@@ -197,40 +200,58 @@ TIER_COMMANDS: dict[int, list[str]] = {
 }
 
 
-def get_tier() -> int:
+LLM_ENV_KEYS = ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")
+
+# The apply stage can be driven two ways. Only the Claude driver needs the
+# Claude Code CLI on PATH; the local driver talks to an OpenAI-compatible
+# endpoint and drives Chrome from Python, so gating it on `claude` would make
+# the feature unreachable on exactly the machines it exists for.
+APPLY_DRIVERS = ("local", "claude")
+DEFAULT_APPLY_DRIVER = "local"
+
+
+def get_tier(driver: str = DEFAULT_APPLY_DRIVER) -> int:
     """Detect the current tier based on available dependencies.
 
-    Tier 1 (Discovery):            Python + pip
+    Tier 1 (Discovery):              Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 3 (Full Auto-Apply):        + Chrome, and the Claude Code CLI when
+                                     driver == "claude"
+
+    Args:
+        driver: Which apply driver to evaluate tier 3 against.
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = any(os.environ.get(k) for k in LLM_ENV_KEYS)
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    needs_claude = driver == "claude"
+    has_claude = shutil.which("claude") is not None
+
+    if has_chrome and (has_claude or not needs_claude):
         return 3
 
     return 2
 
 
-def check_tier(required: int, feature: str) -> None:
+def check_tier(required: int, feature: str, driver: str = DEFAULT_APPLY_DRIVER) -> None:
     """Raise SystemExit with a clear message if the current tier is too low.
 
     Args:
         required: Minimum tier needed (1, 2, or 3).
         feature: Human-readable description of the feature being gated.
+        driver: Apply driver in use, which decides whether the Claude Code CLI
+            is a requirement.
     """
-    current = get_tier()
+    current = get_tier(driver)
     if current >= required:
         return
 
@@ -238,11 +259,14 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
+    if required >= 2 and not any(os.environ.get(k) for k in LLM_ENV_KEYS):
         missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        if driver == "claude" and not shutil.which("claude"):
+            missing.append(
+                "Claude Code CLI — install from [bold]https://claude.ai/code[/bold], "
+                "or use [bold]--driver local[/bold]"
+            )
         try:
             get_chrome_path()
         except FileNotFoundError:
