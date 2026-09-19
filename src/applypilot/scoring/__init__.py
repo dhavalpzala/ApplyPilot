@@ -1,1 +1,1 @@
-"""Scoring pipeline: job scoring, resume tailoring, cover letters, PDF export."""
+"""Scoring pipeline: job scoring, resume attach, cover letters, PDF export."""

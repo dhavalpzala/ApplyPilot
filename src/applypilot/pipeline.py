@@ -38,7 +38,7 @@ STAGE_META: dict[str, dict] = {
     "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
-    "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
+    "tailor":   {"desc": "Attach base resume (no LLM)"},
     "cover":    {"desc": "Cover letter generation"},
     "pdf":      {"desc": "PDF conversion (tailored resumes + cover letters)"},
 }
@@ -121,14 +121,14 @@ def _run_score() -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
-    """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
+def _run_tailor(min_score: int = 7) -> dict:
+    """Stage: attach the user's base resume to high-fit jobs."""
     try:
-        from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, validation_mode=validation_mode)
+        from applypilot.scoring.tailor import run_attach_resume
+        run_attach_resume(min_score=min_score)
         return {"status": "ok"}
     except Exception as e:
-        log.error("Tailoring failed: %s", e)
+        log.error("Resume attach failed: %s", e)
         return {"status": f"error: {e}"}
 
 
@@ -273,6 +273,7 @@ def _run_stage_streaming(
     kwargs: dict = {}
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
+    if stage == "cover":
         kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
@@ -344,6 +345,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
             kwargs: dict = {}
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
+            if name == "cover":
                 kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
@@ -453,7 +455,7 @@ def run_pipeline(
 
     Args:
         stages: List of stage names, or None / ["all"] for full pipeline.
-        min_score: Minimum fit score for tailor/cover stages.
+        min_score: Minimum fit score for the tailor/cover stages.
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.

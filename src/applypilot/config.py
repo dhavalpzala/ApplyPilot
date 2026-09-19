@@ -189,13 +189,13 @@ def load_env():
 
 TIER_LABELS = {
     1: "Discovery",
-    2: "AI Scoring & Tailoring",
+    2: "AI Scoring & Cover Letters",
     3: "Full Auto-Apply",
 }
 
 TIER_COMMANDS: dict[int, list[str]] = {
-    1: ["init", "run discover", "run enrich", "status", "dashboard"],
-    2: ["run score", "run tailor", "run cover", "run pdf", "run"],
+    1: ["init", "run discover", "run enrich", "run tailor", "status", "dashboard"],
+    2: ["run score", "run cover", "run pdf", "run"],
     3: ["apply"],
 }
 
@@ -214,7 +214,7 @@ def get_tier(driver: str = DEFAULT_APPLY_DRIVER) -> int:
     """Detect the current tier based on available dependencies.
 
     Tier 1 (Discovery):              Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
+    Tier 2 (AI Scoring & Covers):    + LLM API key
     Tier 3 (Full Auto-Apply):        + Chrome, and the Claude Code CLI when
                                      driver == "claude"
 

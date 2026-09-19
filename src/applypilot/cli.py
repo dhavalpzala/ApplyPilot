@@ -83,7 +83,7 @@ def run(
             "Defaults to 'all' if omitted."
         ),
     ),
-    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for the tailor/cover stages."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
@@ -91,14 +91,18 @@ def run(
         "normal",
         "--validation",
         help=(
-            "Validation strictness for tailor/cover stages. "
+            "Validation strictness for the cover letter stage. "
             "strict: banned words = errors, judge must pass. "
             "normal: banned words = warnings only (default, recommended for Gemini free tier). "
             "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
         ),
     ),
 ) -> None:
-    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
+    """Run pipeline stages: discover, enrich, score, tailor, cover, pdf.
+
+    The tailor stage attaches the resume you supplied during `applypilot init` —
+    the same document goes out with every application.
+    """
     _bootstrap()
 
     from applypilot.pipeline import run_pipeline
@@ -114,11 +118,11 @@ def run(
             )
             raise typer.Exit(code=1)
 
-    # Gate AI stages behind Tier 2
-    llm_stages = {"score", "tailor", "cover"}
+    # Gate AI stages behind Tier 2 (tailor just attaches the base resume — no LLM)
+    llm_stages = {"score", "cover"}
     if any(s in stage_list for s in llm_stages) or "all" in stage_list:
         from applypilot.config import check_tier
-        check_tier(2, "AI scoring/tailoring")
+        check_tier(2, "AI scoring/cover letters")
 
     # Validate the --validation flag value
     valid_modes = ("strict", "normal", "lenient")
@@ -211,7 +215,7 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    # Check 3: Jobs have a resume attached (skip for --gen with --url)
     if not (gen and url):
         conn = get_connection()
         ready = conn.execute(
@@ -219,7 +223,7 @@ def apply(
         ).fetchone()[0]
         if ready == 0:
             console.print(
-                "[red]No tailored resumes ready.[/red]\n"
+                "[red]No applications ready.[/red]\n"
                 "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
             )
             raise typer.Exit(code=1)
@@ -303,8 +307,8 @@ def status() -> None:
     summary.add_row("Enrichment errors", str(stats["detail_errors"]))
     summary.add_row("Scored by LLM", str(stats["scored"]))
     summary.add_row("Pending scoring", str(stats["unscored"]))
-    summary.add_row("Tailored resumes", str(stats["tailored"]))
-    summary.add_row("Pending tailoring (7+)", str(stats["untailored_eligible"]))
+    summary.add_row("Resume attached", str(stats["tailored"]))
+    summary.add_row("Pending resume attach (7+)", str(stats["untailored_eligible"]))
     summary.add_row("Cover letters", str(stats["with_cover_letter"]))
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
@@ -491,7 +495,7 @@ def doctor() -> None:
     console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
     if tier == 1:
-        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
+        console.print("[dim]  → Tier 2 unlocks: scoring, cover letters (needs LLM API key)[/dim]")
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome)[/dim]")
     elif tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome)[/dim]")

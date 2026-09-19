@@ -32,7 +32,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pruned from history. Both are load-bearing: local latency measured ~9s at 3.5k prompt
     tokens but ~117s at 41k, and unfiltered ATS snapshots land in that upper band.
 
+### Changed
+- **The `tailor` stage no longer rewrites your resume per job.** It now attaches the resume
+  you supplied during `applypilot init` to every job above the score threshold, so the same
+  document is uploaded with every application. The stage makes zero LLM calls and writes no
+  files — it stamps `tailored_resume_path` with `~/.applypilot/resume.pdf` and finishes in
+  milliseconds instead of minutes.
+  - `scoring/tailor.py` gains `run_attach_resume()` and `_ensure_base_resume_pdf()`, which
+    generates `resume.pdf` from `resume.txt` when the wizard only received a text resume —
+    the PDF is the artifact that actually gets uploaded. The per-job LLM path
+    (`tailor_resume()` / `run_tailoring()`) is left in the module but is no longer wired
+    into the pipeline.
+  - `applypilot init` now asks for the PDF companion when you supply a `.txt` (it already
+    asked the reverse), and warns when neither is available.
+  - `run tailor` drops to tier 1 — it no longer needs an LLM key. Cover letters are
+    unaffected and are still written per job; they always read the base resume anyway.
+  - Existing rows keep whatever tailored resume they already have. To move everything onto
+    the base resume:
+    `UPDATE jobs SET tailored_resume_path=NULL, tailor_attempts=0 WHERE applied_at IS NULL;`
+
 ### Fixed
+- **`apply --gen --url` found no job for any never-attempted row.** `acquire_job()`'s
+  targeted branch filtered on `apply_status != 'in_progress'`, which is NULL — not true —
+  when `apply_status` is NULL, so freshly prepared jobs were invisible. Now uses
+  `COALESCE(apply_status, '') != 'in_progress'`.
 - **`doctor` reported the wrong LLM provider.** It checked `GEMINI_API_KEY` before `LLM_URL`,
   while `llm.py::_detect_provider` gives `LLM_URL` precedence over both API keys. With a
   Gemini key and a local URL both set — the documented local-mode setup — doctor claimed

@@ -37,7 +37,10 @@ console = Console()
 
 def _setup_resume() -> None:
     """Prompt for resume file and copy into APP_DIR."""
-    console.print(Panel("[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt or .pdf)."))
+    console.print(Panel(
+        "[bold]Step 1: Resume[/bold]\nPoint to your master resume file (.txt or .pdf).\n"
+        "[dim]This exact file is uploaded with every application — it is never rewritten per job.[/dim]"
+    ))
 
     while True:
         path_str = Prompt.ask("Resume file path")
@@ -55,23 +58,46 @@ def _setup_resume() -> None:
         if suffix == ".txt":
             shutil.copy2(src, RESUME_PATH)
             console.print(f"[green]Copied to {RESUME_PATH}[/green]")
+
+            # The PDF is what actually gets uploaded to application forms.
+            _ask_companion(
+                "PDF version of your resume (.pdf)", ".pdf", RESUME_PDF_PATH,
+                warning="[yellow]No PDF provided — ApplyPilot will generate one from the "
+                        "text, which may not match your formatting.[/yellow]",
+            )
         elif suffix == ".pdf":
             shutil.copy2(src, RESUME_PDF_PATH)
             console.print(f"[green]Copied to {RESUME_PDF_PATH}[/green]")
 
             # Also ask for a plain-text version for LLM consumption
-            txt_path_str = Prompt.ask(
-                "Plain-text version of your resume (.txt)",
-                default="",
+            _ask_companion(
+                "Plain-text version of your resume (.txt)", ".txt", RESUME_PATH,
             )
-            if txt_path_str.strip():
-                txt_src = Path(txt_path_str.strip().strip('"').strip("'")).expanduser().resolve()
-                if txt_src.exists():
-                    shutil.copy2(txt_src, RESUME_PATH)
-                    console.print(f"[green]Copied to {RESUME_PATH}[/green]")
-                else:
-                    console.print("[yellow]File not found, skipping plain-text copy.[/yellow]")
         break
+
+
+def _ask_companion(question: str, suffix: str, dest: Path, warning: str = "") -> None:
+    """Optionally copy the companion format of the resume into APP_DIR.
+
+    Args:
+        question: Prompt text.
+        suffix:   Expected file extension, e.g. ".pdf".
+        dest:     Where to copy the file.
+        warning:  Shown when the user skips the prompt.
+    """
+    answer = Prompt.ask(question, default="")
+    if not answer.strip():
+        if warning:
+            console.print(warning)
+        return
+
+    src = Path(answer.strip().strip('"').strip("'")).expanduser().resolve()
+    if not src.exists():
+        console.print(f"[yellow]File not found, skipping {suffix} copy.[/yellow]")
+        return
+
+    shutil.copy2(src, dest)
+    console.print(f"[green]Copied to {dest}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +106,7 @@ def _setup_resume() -> None:
 
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
-    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, tailoring, and auto-fill."))
+    console.print(Panel("[bold]Step 2: Profile[/bold]\nTell ApplyPilot about yourself. This powers scoring, cover letters, and auto-fill."))
 
     profile: dict = {}
 
@@ -147,9 +173,9 @@ def _setup_profile() -> dict:
         "tools": [s.strip() for s in tools.split(",") if s.strip()],
     }
 
-    # -- Resume Facts (preserved truths for tailoring) --
+    # -- Resume Facts (ground truth the AI must not invent around) --
     console.print("\n[bold cyan]Resume Facts[/bold cyan]")
-    console.print("[dim]These are preserved exactly during resume tailoring — the AI will never change them.[/dim]")
+    console.print("[dim]Cover letters are checked against these — the AI will never change or invent them.[/dim]")
     companies = Prompt.ask("Companies to always keep (comma-separated)", default="")
     projects = Prompt.ask("Projects to always keep (comma-separated)", default="")
     school = Prompt.ask("School name(s) to preserve", default="")
@@ -234,14 +260,14 @@ def _setup_searches() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Ask about AI scoring/cover letters — optional LLM configuration."""
     console.print(Panel(
         "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
+        "An LLM powers job scoring and cover letters.\n"
         "Without this, you can still discover and enrich jobs."
     ))
 
-    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
+    if not Confirm.ask("Enable AI scoring and cover letters?", default=True):
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
@@ -288,7 +314,7 @@ def _setup_auto_apply() -> None:
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
-        console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
+        console.print("[dim]You can apply manually using the cover letters ApplyPilot generates.[/dim]")
         return
 
     # Check for Claude Code CLI

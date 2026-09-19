@@ -45,9 +45,9 @@ discover → enrich → score → tailor → cover → pdf → apply
 | discover | `discovery/{jobspy,workday,smartextract}.py` | `url,title,site,strategy,…` | smartextract only |
 | enrich | `enrichment/detail.py` | `full_description, application_url` | tier-3 fallback only |
 | score | `scoring/scorer.py` | `fit_score, score_reasoning` | yes |
-| tailor | `scoring/tailor.py` | `tailored_resume_path, tailor_attempts` | yes |
+| tailor | `scoring/tailor.py` | `tailored_resume_path, tailor_attempts` | no |
 | cover | `scoring/cover_letter.py` | `cover_letter_path, cover_attempts` | yes |
-| pdf | `scoring/pdf.py` | rewrites `tailored_resume_path` `.txt`→`.pdf` | no |
+| pdf | `scoring/pdf.py` | nothing (globs `TAILORED_DIR` for orphan `.txt`) | no |
 | apply | `apply/launcher.py` | `apply_status, applied_at, apply_attempts, …` | local model (default) or Claude Code CLI |
 
 Note: directory names are `discovery/`, `enrichment/`, `scoring/`, `apply/`, `wizard/`. The "Project Structure" section of `CONTRIBUTING.md` is stale (it lists `discover/`, `score/`, `tailor/`, `utils/`, `docs/`, none of which exist), as are its `applypilot discover --employer/--site` examples — no `discover` subcommand exists.
@@ -55,6 +55,26 @@ Note: directory names are `discovery/`, `enrichment/`, `scoring/`, `apply/`, `wi
 ### State lives outside the repo
 
 Everything user-specific is under `~/.applypilot/` (override with `APPLYPILOT_DIR`): `applypilot.db`, `profile.json`, `resume.txt`/`.pdf`, `searches.yaml`, `.env`, `tailored_resumes/`, `cover_letters/`, `logs/`, per-worker Chrome profiles. `config.py` is the single source of every path — never hardcode one. Package-shipped registries (`config/employers.yaml`, `config/sites.yaml`, `config/searches.example.yaml`) live inside `src/applypilot/config/` and are declared in `[tool.hatch.build] artifacts`; new YAML there is picked up by that glob.
+
+### The tailor stage attaches, it does not tailor
+
+`tailor` stamps every qualifying row's `tailored_resume_path` with `~/.applypilot/resume.pdf` — the
+resume the user supplied at `init` goes out with every application, unchanged. `run_attach_resume()`
+makes no LLM calls and writes no files; it takes milliseconds.
+
+The column keeps its old name because **eight places gate on `tailored_resume_path IS NOT NULL`**
+(`database.py` stage predicates and `get_stats`, `pipeline.py::_PENDING_SQL`, `cover_letter.py`'s
+selection, `cli.py`'s apply preflight, `acquire_job()`'s two branches, and a hard `ValueError` in
+`apply/prompt.py`). Stamping the column satisfies all of them at once, which is why this is an
+attach step rather than a skipped stage — do not "simplify" it into a stage removal.
+
+Nothing in the apply path needed changing, because consumers derive siblings by suffix:
+`apply/prompt.py` does `with_suffix(".pdf")` (the upload) and `launcher.py`/`local_agent.py` do
+`with_suffix(".txt")` (the text pasted into the prompt). Both resolve against the stored path, so
+`resume.pdf` and `resume.txt` must stay a matched pair — `_ensure_base_resume_pdf()` generates the
+PDF from the text when the wizard only got a `.txt`.
+
+`run_tailoring()` / `tailor_resume()` are still in `scoring/tailor.py`, unreferenced by the pipeline.
 
 ### Database schema changes
 
@@ -106,6 +126,6 @@ The agent's contract either way is a single `RESULT:` line — `APPLIED`, `EXPIR
 - **No hardcoded personal data.** Every prompt builder, validator, and scraper takes the user's `profile.json` (via `config.load_profile()`) at runtime. Several module docstrings state this explicitly; it is the invariant that made the project shareable. Same for search terms and site lists — those come from `searches.yaml` / `sites.yaml`.
 - **Lazy imports in `cli.py`.** Commands import their implementation inside the function body to keep `applypilot --help` fast and to let tier-1 users run without heavy optional deps (jobspy, playwright) installed.
 - **`_bootstrap()` before any DB work** in a CLI command: `load_env()` → `ensure_dirs()` → `init_db()`.
-- **LLM output is never trusted directly.** `tailor.py`/`cover_letter.py` ask for structured JSON, then *code* assembles the final document — the resume header (name, contact) is always code-injected. `scoring/validator.py` then checks banned words, LLM leak phrases, fabrication against `profile["resume_facts"]`, and required sections. Strictness is `--validation strict|normal|lenient` (`normal` is default; banned words are warnings there). Failed generations increment `tailor_attempts`/`cover_attempts` and are abandoned at 5.
+- **LLM output is never trusted directly.** `cover_letter.py` asks for structured JSON, then *code* assembles the final document. `scoring/validator.py` then checks banned words, LLM leak phrases, fabrication against `profile["resume_facts"]`, and required sections. Strictness is `--validation strict|normal|lenient` (`normal` is default; banned words are warnings there). Failed generations increment `cover_attempts` and are abandoned at 5. `tailor.py` still contains the same machinery for per-job resume rewriting, but it is no longer wired into the pipeline — see "The tailor stage attaches, it does not tailor" above.
 - Type hints and Google-style docstrings on public functions, `from __future__ import annotations` in newer modules. `CONTRIBUTING.md` says 100-char lines; Ruff is configured for 120 — Ruff wins.
 - Update `CHANGELOG.md` under `[Unreleased]`. Releases are tag-driven: pushing `v*` triggers `publish.yml` (PyPI OIDC trusted publishing), so bump `version` in `pyproject.toml` and `__init__.py` together.

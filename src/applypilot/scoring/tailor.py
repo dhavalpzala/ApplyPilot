@@ -1,12 +1,13 @@
-"""Resume tailoring: LLM-powered ATS-optimized resume generation per job.
+"""Resume stage: attach the user's base resume to every matching job.
 
-THIS IS THE HEAVIEST REFACTOR. Every piece of personal data -- name, email, phone,
-skills, companies, projects, school -- is loaded at runtime from the user's profile.
-Zero hardcoded personal information.
+`run_attach_resume()` is what the pipeline runs. It makes no LLM calls -- it stamps
+every pending job with the resume the user supplied during `applypilot init`, so the
+same document goes out with every application.
 
-The LLM returns structured JSON, code assembles the final text. Header (name, contact)
-is always code-injected, never LLM-generated. Each retry starts a fresh conversation
-to avoid apologetic spirals.
+The per-job LLM tailoring path (`tailor_resume()` / `run_tailoring()`) is kept below
+but is no longer wired into the pipeline. Every piece of personal data -- name, email,
+phone, skills, companies, projects, school -- is loaded at runtime from the user's
+profile. Zero hardcoded personal information.
 """
 
 import json
@@ -16,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import RESUME_PATH, RESUME_PDF_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -462,11 +463,89 @@ def tailor_resume(
     return tailored, report
 
 
+# ── Base Resume Attach (the stage the pipeline runs) ─────────────────────
+
+def _ensure_base_resume_pdf() -> Path:
+    """Return the base resume PDF, generating it from resume.txt if missing.
+
+    The PDF is the artifact the apply agent uploads, so it has to exist before
+    any job is marked ready. `applypilot init` only writes resume.pdf when the
+    user supplied a PDF, hence the .txt fallback.
+
+    Returns:
+        Path to the base resume PDF.
+
+    Raises:
+        FileNotFoundError: If neither resume.pdf nor resume.txt exists.
+    """
+    if RESUME_PDF_PATH.exists():
+        return RESUME_PDF_PATH
+
+    if RESUME_PATH.exists():
+        try:
+            from applypilot.scoring.pdf import convert_to_pdf
+            convert_to_pdf(RESUME_PATH, RESUME_PDF_PATH)
+            log.info("Generated %s from %s", RESUME_PDF_PATH, RESUME_PATH)
+            return RESUME_PDF_PATH
+        except Exception as e:
+            raise FileNotFoundError(
+                f"No resume PDF at {RESUME_PDF_PATH}, and converting {RESUME_PATH} failed: {e}. "
+                f"Copy your resume PDF to {RESUME_PDF_PATH} or re-run `applypilot init`."
+            ) from e
+
+    raise FileNotFoundError(
+        f"No resume found at {RESUME_PDF_PATH} or {RESUME_PATH}. Run `applypilot init`."
+    )
+
+
+def run_attach_resume(min_score: int = 7, limit: int = 1000) -> dict:
+    """Attach the base resume to every high-scoring job awaiting one.
+
+    No LLM calls and no generated files -- each job is stamped with the path to
+    the resume PDF the user supplied at setup, so the same document is uploaded
+    everywhere. Consumers derive siblings by suffix (`.pdf` for the upload,
+    `.txt` for the prompt text), so the stored path resolves both ways.
+
+    Args:
+        min_score: Minimum fit_score to attach for.
+        limit:     Maximum jobs to process in one pass.
+
+    Returns:
+        {"approved": int, "failed": int, "errors": int, "elapsed": float}
+    """
+    resume_pdf = _ensure_base_resume_pdf()
+    conn = get_connection()
+
+    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    if not jobs:
+        log.info("No jobs awaiting a resume with score >= %d.", min_score)
+        return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
+
+    t0 = time.time()
+    now = datetime.now(timezone.utc).isoformat()
+    for job in jobs:
+        conn.execute(
+            "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+            "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+            (str(resume_pdf), now, job["url"]),
+        )
+    conn.commit()
+
+    elapsed = time.time() - t0
+    log.info("Attached base resume to %d jobs in %.1fs (score >= %d).",
+             len(jobs), elapsed, min_score)
+
+    return {"approved": len(jobs), "failed": 0, "errors": 0, "elapsed": elapsed}
+
+
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
                   validation_mode: str = "normal") -> dict:
     """Generate tailored resumes for high-scoring jobs.
+
+    No longer wired into the pipeline -- the `tailor` stage runs
+    `run_attach_resume()` instead. Kept for callers that want a per-job rewrite.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
