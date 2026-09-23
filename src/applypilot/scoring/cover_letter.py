@@ -89,6 +89,14 @@ VOICE:
 - NEVER hedge. BAD: "might address some of your challenges." GOOD: "solves the same problem your team is facing."
 - Every sentence should contain either a number, a tool name, or a specific outcome. If it doesn't, cut it.
 - Read it out loud. If it sounds like a robot wrote it, rewrite it.
+- Make sure the cover letter sounds natural and not AI generated.
+- Score the cover letter for 1. the Data extraction from resume, 2. relevance to Job Description and human written, if score is less that 85% in any of the 3 category, rewrite the cover letter.
+- Do not invent anything on your own, Only extract the details from the resume.
+- Cross check 3 times by 3 different ways to make sure it sounds natural and not AI generated.
+- Do not use any quotes or special characters in the cover letter.
+- Cross check the cover letter by 3 times for grammatical errors and spelling mistakes.
+
+
 
 FABRICATION = INSTANT REJECTION:
 The candidate's real tools are ONLY: {skills_str}.
